@@ -1,5 +1,5 @@
 import { sleep } from '@scrypted/common/src/sleep';
-import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from "@scrypted/sdk";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, FFmpegInput, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting } from "@scrypted/sdk";
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { EventEmitter } from "stream";
 import { createRtspMediaStreamOptions, Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
@@ -8,6 +8,9 @@ import { listenEvents } from './onvif-events';
 import { OnvifIntercom } from './onvif-intercom';
 import { DevInfo } from './probe';
 import { AIState, Enc, ReolinkCameraClient } from './reolink-api';
+import path from 'path';
+
+const { mediaManager } = sdk;
 
 class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     sirenTimeout: NodeJS.Timeout;
@@ -57,6 +60,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     videoStreamOptions: Promise<UrlMediaStreamOptions[]>;
     motionTimeout: NodeJS.Timeout;
     siren: ReolinkCameraSiren;
+    lastSnapshotWithMotion;
 
     storageSettings = new StorageSettings(this, {
         doorbell: {
@@ -117,6 +121,11 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             title: 'Use ONVIF for Two-Way Audio',
             type: 'boolean',
         },
+        isBatteryCamera: {
+            subgroup: 'Advanced',
+            title: 'Is Battery Camera',
+            type: 'boolean',
+        }
     });
 
     constructor(nativeId: string, provider: RtspProvider) {
@@ -422,9 +431,21 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         };
 
         const triggerMotion = () => {
+            if (this.motionDetected !== true) {
+                if (this.storageSettings.values.isBatteryCamera) {
+                    this.onDeviceEvent(ScryptedInterface.VideoCamera, true);
+                }
+            }
+
             this.motionDetected = true;
             clearTimeout(this.motionTimeout);
-            this.motionTimeout = setTimeout(() => this.motionDetected = false, this.storageSettings.values.motionTimeout * 1000);
+            this.motionTimeout = setTimeout(() => {
+                this.motionDetected = false;
+                
+                if (this.storageSettings.values.isBatteryCamera) {
+                    setTimeout(() => this.onDeviceEvent(ScryptedInterface.VideoCamera, false), 1000);
+                }
+            }, this.storageSettings.values.motionTimeout * 1000);
         };
         (async () => {
             while (!killed) {
@@ -445,7 +466,21 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     }
 
     async takeSmartCameraPicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        return this.createMediaObject(await this.getClient().jpegSnapshot(options?.timeout), 'image/jpeg');
+        if (this.storageSettings.values.isBatteryCamera && options?.periodicRequest !== false
+            && this.lastSnapshotWithMotion && !this.motionDetected) {
+            this.console.log('Battery camera returning last cached snapshot due to periodic request');
+            // Periodic requests on a battery camera should return the last cached snapshot from
+            // when motion occurred
+            return this.createMediaObject(this.lastSnapshotWithMotion, 'image/jpeg');
+        } else {
+            const jpegSnapshot = await this.getClient().jpegSnapshot(options?.timeout);
+
+            if (this.motionDetected || !this.lastSnapshotWithMotion) {
+                this.lastSnapshotWithMotion = jpegSnapshot;
+            }
+
+            return this.createMediaObject(jpegSnapshot, 'image/jpeg');
+        }
     }
 
     async getUrlSettings(): Promise<Setting[]> {
@@ -492,6 +527,43 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         return super.createVideoStream(vso);
     }
 
+    async getVideoStream(options?: UrlMediaStreamOptions): Promise<MediaObject> {
+        if (!this.storageSettings.values.isBatteryCamera) {
+            // Non-battery cameras use the normal video stream
+            return super.getVideoStream(options);
+        } else {
+            // Battery cameras wake up and sleep, and therefore we swap between two
+            // streams depending on the motion state of the camera
+            return this.getBatteryCameraVideoStream(options);
+        }
+    }
+
+    private async getBatteryCameraVideoStream(options?: UrlMediaStreamOptions): Promise<MediaObject> {
+        if (this.motionDetected) {
+            return super.getVideoStream(options);
+        } else {
+            // If the motion has timed out, then we can return a blank screen. This is almost
+            // the same as the example camera plugin.
+            let ffmpegInput: FFmpegInput;
+
+            const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'reolink-sleeping.mp4');
+
+            ffmpegInput = {
+                // the input doesn't HAVE to be an url, but if it is, provide this hint.
+                url: undefined,
+                inputArguments: [
+                    '-re',
+                    '-stream_loop', '-1',
+                    '-i', file,
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420',
+                ]
+            };
+
+            return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInput)), ScryptedMimeTypes.FFmpegInput);
+        }
+    }
+
     async getConstructedVideoStreamOptions(): Promise<UrlMediaStreamOptions[]> {
         this.videoStreamOptions ||= this.getConstructedVideoStreamOptionsInternal().catch(e => {
             this.constructedVideoStreamOptions = undefined;
@@ -520,7 +592,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
 
         const channel = (this.getRtspChannel() + 1).toString().padStart(2, '0');
 
-        const streams: UrlMediaStreamOptions[] = [
+        let streams: UrlMediaStreamOptions[] = [
             {
                 name: '',
                 id: 'main.bcs',
@@ -598,6 +670,11 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
                 video: { width: 896, height: 512 },
                 url: '',
             });
+        }
+
+        if (this.storageSettings.values.isBatteryCamera) {
+            // Remove all container=rtsp streams for battery cameras
+            streams = streams.filter(s => s.container !== 'rtsp');
         }
 
         for (const stream of streams) {
